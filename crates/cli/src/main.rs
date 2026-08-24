@@ -31,6 +31,7 @@ OPTIONS (run):
   --all            Run every request in the file, in order
   --env <name>     Environment to use (see http-client.env.json)
   --no-env         Ignore the persisted environment selection
+  --no-cookies     Do not load or update the project cookie jar
   --root <path>    Project root used for env discovery (default: git root)
   --curl <path>    Path to the curl binary (default: `curl` from PATH)
   --fail-on-http-error    Exit non-zero when a response status is >= 400
@@ -65,6 +66,7 @@ struct RunOptions {
     all: bool,
     env_name: Option<String>,
     no_env: bool,
+    no_cookies: bool,
     root: Option<PathBuf>,
     curl: String,
     fail_on_http_error: bool,
@@ -143,6 +145,17 @@ fn run(args: &[String]) -> ExitCode {
     let mut rng = Rng::new();
     let system_env = |name: &str| std::env::var(name).ok();
     let mut failed = false;
+    let cookie_jar = if options.no_cookies {
+        None
+    } else {
+        match prepare_cookie_jar(&root) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("warning: cookies disabled: {error}");
+                None
+            }
+        }
+    };
 
     for index in selected {
         let request = &doc.requests[index];
@@ -171,7 +184,7 @@ fn run(args: &[String]) -> ExitCode {
                 break;
             }
         };
-        match execute_with_curl(&options.curl, &resolved) {
+        match execute_with_curl(&options.curl, &resolved, cookie_jar.as_deref()) {
             Ok(response) => {
                 process_response(&resolved, &response, &mut state);
                 if let Err(error) = write_redirect(&resolved, &response, &options.file) {
@@ -187,6 +200,9 @@ fn run(args: &[String]) -> ExitCode {
                 let mut formatted = format_response_plain(&resolved, &response, &state.logs);
                 if let Some(path) = saved_path {
                     formatted.push_str(&format!("\nResponse saved to {}\n", path.display()));
+                }
+                if let Err(error) = append_request_log(&resolved, &response, &root) {
+                    eprintln!("warning: could not append request log: {error}");
                 }
                 print!("{formatted}");
                 for error in &state.handler_errors {
@@ -326,6 +342,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut all = false;
     let mut env_name = None;
     let mut no_env = false;
+    let mut no_cookies = false;
     let mut root: Option<PathBuf> = None;
     let mut curl = std::env::var("CURL").unwrap_or_else(|_| "curl".to_string());
     let mut fail_on_http_error = false;
@@ -374,6 +391,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
             }
             "--all" => all = true,
             "--no-env" => no_env = true,
+            "--no-cookies" => no_cookies = true,
             "--fail-on-http-error" => fail_on_http_error = true,
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other if file.is_none() => file = Some(PathBuf::from(other)),
@@ -390,6 +408,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         all,
         env_name,
         no_env,
+        no_cookies,
         root,
         curl,
         fail_on_http_error,
@@ -516,7 +535,11 @@ fn select_environment(
     Ok(name)
 }
 
-fn execute_with_curl(curl: &str, request: &ResolvedRequest) -> Result<ResponseData, String> {
+fn execute_with_curl(
+    curl: &str,
+    request: &ResolvedRequest,
+    cookie_jar: Option<&Path>,
+) -> Result<ResponseData, String> {
     let temp = temp_dir();
     let token = format!(
         "http-client-{}-{}",
@@ -531,6 +554,7 @@ fn execute_with_curl(curl: &str, request: &ResolvedRequest) -> Result<ResponseDa
     let request_body_file = temp.join(format!("{token}.request-body"));
 
     let mut args: Vec<String> = vec!["-sS".into(), "-X".into(), request.method.clone()];
+    add_cookie_jar_args(&mut args, request, cookie_jar);
     for (name, value) in &request.headers {
         args.push("-H".into());
         args.push(format!("{name}: {value}"));
@@ -722,7 +746,7 @@ fn save_response_file(
     response: &ResponseData,
     root: &Path,
 ) -> Result<PathBuf, String> {
-    let directory = root.join(".http-client").join("httpRequests");
+    let directory = runtime_directory(root).join("httpRequests");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
     let timestamp = SystemTime::now()
@@ -753,6 +777,188 @@ fn save_response_file(
     Ok(path)
 }
 
+fn runtime_directory(root: &Path) -> PathBuf {
+    root.join(".http-client")
+}
+
+fn prepare_cookie_jar(root: &Path) -> Result<PathBuf, String> {
+    let directory = runtime_directory(root);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let path = directory.join("http-client.cookies");
+    if !path.exists() {
+        std::fs::File::create(&path)
+            .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn request_has_header(request: &ResolvedRequest, expected_name: &str) -> bool {
+    request
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(expected_name))
+}
+
+fn add_cookie_jar_args(
+    args: &mut Vec<String>,
+    request: &ResolvedRequest,
+    cookie_jar: Option<&Path>,
+) {
+    let Some(cookie_jar) = cookie_jar else {
+        return;
+    };
+    let jar = cookie_jar.display().to_string();
+    if !request_has_header(request, "cookie") {
+        args.push("--cookie".into());
+        args.push(jar.clone());
+    }
+    args.push("--cookie-jar".into());
+    args.push(jar);
+}
+
+fn append_request_log(
+    request: &ResolvedRequest,
+    response: &ResponseData,
+    root: &Path,
+) -> Result<(), String> {
+    let directory = runtime_directory(root);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let mut entry = format!(
+        "### {timestamp} - {} {}\n{} {}\n",
+        response.status, request.name, request.method, request.url
+    );
+    for (name, value) in &request.headers {
+        entry.push_str(&format!("{name}: {value}\n"));
+    }
+    if let Some(body) = &request.body {
+        entry.push('\n');
+        entry.push_str(body);
+        entry.push('\n');
+    }
+    entry.push_str(&format!(
+        "# Response: {} {}\n\n",
+        response.status, response.status_text
+    ));
+    let path = directory.join("http-requests-log.http");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    file.write_all(entry.as_bytes())
+        .map_err(|error| format!("cannot append {}: {error}", path.display()))
+}
+
 fn temp_dir() -> PathBuf {
     std::env::temp_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("http-client-{name}-{}-{stamp}", std::process::id()))
+    }
+
+    fn request(headers: Vec<(&str, &str)>) -> ResolvedRequest {
+        ResolvedRequest {
+            name: "Create session".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/sessions".to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: Some(r#"{"user":"alice"}"#.to_string()),
+            follow_redirects: true,
+            timeout_secs: None,
+            connection_timeout_secs: None,
+            handler: None,
+            redirect_to: None,
+        }
+    }
+
+    fn response() -> ResponseData {
+        ResponseData {
+            status: 201,
+            protocol: "HTTP/1.1".to_string(),
+            status_text: "Created".to_string(),
+            headers: Vec::new(),
+            redirects: Vec::new(),
+            body: Vec::new(),
+            elapsed_ms: 1,
+        }
+    }
+
+    #[test]
+    fn creates_project_cookie_jar() {
+        let root = test_root("cookies");
+        let jar = prepare_cookie_jar(&root).unwrap();
+        assert_eq!(jar, root.join(".http-client").join("http-client.cookies"));
+        assert!(jar.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_cookie_header_takes_precedence() {
+        let request = request(vec![("cOoKiE", "session=manual")]);
+        assert!(request_has_header(&request, "cookie"));
+    }
+
+    #[test]
+    fn adds_cookie_jar_options_and_preserves_explicit_cookie_header() {
+        let root = test_root("curl-args");
+        let jar = root.join("http-client.cookies");
+        let mut args = Vec::new();
+        add_cookie_jar_args(&mut args, &request(Vec::new()), Some(&jar));
+        assert_eq!(
+            args,
+            vec![
+                "--cookie",
+                jar.to_str().unwrap(),
+                "--cookie-jar",
+                jar.to_str().unwrap()
+            ]
+        );
+
+        let mut explicit_cookie_args = Vec::new();
+        add_cookie_jar_args(
+            &mut explicit_cookie_args,
+            &request(vec![("Cookie", "session=manual")]),
+            Some(&jar),
+        );
+        assert_eq!(
+            explicit_cookie_args,
+            vec!["--cookie-jar", jar.to_str().unwrap()]
+        );
+    }
+
+    #[test]
+    fn appends_request_log_in_runtime_directory() {
+        let root = test_root("log");
+        append_request_log(&request(Vec::new()), &response(), &root).unwrap();
+        let path = root.join(".http-client").join("http-requests-log.http");
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("POST https://example.com/sessions"));
+        assert!(log.contains("# Response: 201 Created"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_no_cookies_flag() {
+        let options =
+            parse_run_args(&["example.http".to_string(), "--no-cookies".to_string()]).unwrap();
+        assert!(options.no_cookies);
+    }
 }
