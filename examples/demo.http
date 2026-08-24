@@ -1,0 +1,34 @@
+@base = {{host}}
+@json = application/json
+
+### Health check
+GET {{base}}/get?source=http-client
+ &a=1
+Accept: application/json
+Content-Type: application/json
+
+### Create resource
+# @timeout 30
+# @connection-timeout 5
+POST {{base}}/post
+Content-Type: {{json}}
+Authorization: Bearer {{token}}
+
+{
+  "user": "{{user}}",
+  "requestId": "{{$uuid}}"
+}
+
+> {%
+client.global.set("createdUrl", response.body.json().url)
+client.log(response.status)
+%}
+
+### Follow redirect
+GET https://httpbin.org/redirect/2
+Hash: test
+
+### Do not follow redirect
+# @no-redirect
+GET https://httpbin.org/redirect/1
+Hash: tttt

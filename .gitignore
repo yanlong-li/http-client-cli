@@ -1,0 +1,5 @@
+target/
+http-client.private.env.json
+.http-client-env
+.zed-http-env
+.http-client/
