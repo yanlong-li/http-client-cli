@@ -4,7 +4,7 @@
 
 use http_client_core::env::load_environments;
 use http_client_core::execute::{
-    process_response, resolve_request, ResolvedRequest, ResponseData, RunState,
+    process_pre_request, process_response, resolve_request, ResolvedRequest, ResponseData, RunState,
 };
 use http_client_core::output::format_response_plain;
 use http_client_core::parser::parse;
@@ -36,7 +36,7 @@ OPTIONS (run):
   --curl <path>    Path to the curl binary (default: `curl` from PATH)
   --fail-on-http-error    Exit non-zero when a response status is >= 400
 
-Environment selection order: --env > $HTTP_CLIENT_ENV > .http-client-env file
+Environment selection order: --env > $HTTP_CLIENT_ENV > .http-client/http-client-env file
 at the project root. If none is set, the request runs without environment
 variables. Variables resolve as: environment > global > file > per-request
 (compatible precedence).";
@@ -141,7 +141,17 @@ fn run(args: &[String]) -> ExitCode {
         .iter()
         .map(|(name, value)| (name.clone(), Value::String(value.clone())))
         .collect();
-    let mut state = RunState::default();
+    let persisted_globals = match load_persisted_globals(&root) {
+        Ok(globals) => globals,
+        Err(error) => {
+            eprintln!("warning: could not load persisted globals: {error}");
+            BTreeMap::new()
+        }
+    };
+    let mut state = RunState {
+        globals: persisted_globals,
+        ..RunState::default()
+    };
     let mut rng = Rng::new();
     let system_env = |name: &str| std::env::var(name).ok();
     let mut failed = false;
@@ -159,11 +169,19 @@ fn run(args: &[String]) -> ExitCode {
 
     for index in selected {
         let request = &doc.requests[index];
+        let globals_before_pre_request = state.globals.clone();
+        process_pre_request(request, &mut state);
+        if state.globals != globals_before_pre_request {
+            if let Err(error) = persist_globals(&root, &state.globals) {
+                eprintln!("warning: could not persist globals: {error}");
+            }
+        }
         let resolved = match resolve_request(
             request,
             &file_vars,
             &env_vars,
             &state.globals,
+            &state.global_headers,
             &system_env,
             &mut rng,
         ) {
@@ -186,7 +204,13 @@ fn run(args: &[String]) -> ExitCode {
         };
         match execute_with_curl(&options.curl, &resolved, cookie_jar.as_deref()) {
             Ok(response) => {
+                let globals_before_handler = state.globals.clone();
                 process_response(&resolved, &response, &mut state);
+                if state.globals != globals_before_handler {
+                    if let Err(error) = persist_globals(&root, &state.globals) {
+                        eprintln!("warning: could not persist globals: {error}");
+                    }
+                }
                 if let Err(error) = write_redirect(&resolved, &response, &options.file) {
                     eprintln!("warning: could not redirect response: {error}");
                 }
@@ -322,7 +346,13 @@ fn env_command(args: &[String]) -> ExitCode {
                 eprintln!("error: environment `{name}` not found");
                 return ExitCode::FAILURE;
             }
-            let marker = root.join(".http-client-env");
+            let marker = environment_marker_path(&root);
+            if let Some(directory) = marker.parent() {
+                if let Err(error) = std::fs::create_dir_all(directory) {
+                    eprintln!("error: cannot create {}: {error}", directory.display());
+                    return ExitCode::FAILURE;
+                }
+            }
             if let Err(error) = std::fs::write(&marker, name) {
                 eprintln!("error: cannot write {}: {error}", marker.display());
                 return ExitCode::FAILURE;
@@ -514,7 +544,7 @@ fn select_environment(
         Some(name.clone())
     } else if let Ok(name) = std::env::var("HTTP_CLIENT_ENV") {
         Some(name)
-    } else if let Ok(name) = std::fs::read_to_string(root.join(".http-client-env")) {
+    } else if let Ok(name) = std::fs::read_to_string(environment_marker_path(root)) {
         let name = name.trim().to_string();
         (!name.is_empty()).then_some(name)
     } else {
@@ -781,6 +811,33 @@ fn runtime_directory(root: &Path) -> PathBuf {
     root.join(".http-client")
 }
 
+fn environment_marker_path(root: &Path) -> PathBuf {
+    runtime_directory(root).join("http-client-env")
+}
+
+fn persisted_globals_path(root: &Path) -> PathBuf {
+    runtime_directory(root).join("http-client-globals.json")
+}
+
+fn load_persisted_globals(root: &Path) -> Result<BTreeMap<String, Value>, String> {
+    let path = persisted_globals_path(root);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_json::from_str(&text).map_err(|error| format!("cannot parse {}: {error}", path.display()))
+}
+
+fn persist_globals(root: &Path, globals: &BTreeMap<String, Value>) -> Result<(), String> {
+    let directory = runtime_directory(root);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let path = persisted_globals_path(root);
+    let text = serde_json::to_string_pretty(globals).map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
 fn prepare_cookie_jar(root: &Path) -> Result<PathBuf, String> {
     let directory = runtime_directory(root);
     std::fs::create_dir_all(&directory)
@@ -884,6 +941,7 @@ mod tests {
             follow_redirects: true,
             timeout_secs: None,
             connection_timeout_secs: None,
+            pre_request_script: None,
             handler: None,
             redirect_to: None,
         }
@@ -952,6 +1010,45 @@ mod tests {
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("POST https://example.com/sessions"));
         assert!(log.contains("# Response: 201 Created"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_environment_selection_from_runtime_directory() {
+        let root = test_root("environment-marker");
+        let marker = environment_marker_path(&root);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "dev\n").unwrap();
+        let environments = vec![http_client_core::env::Environment {
+            name: "dev".to_string(),
+            vars: BTreeMap::new(),
+        }];
+        let options = parse_run_args(&["example.http".to_string()]).unwrap();
+
+        assert_eq!(
+            select_environment(&options, &root, &environments).unwrap(),
+            Some("dev".to_string())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persists_globals_in_runtime_directory() {
+        let root = test_root("persisted-globals");
+        let globals = BTreeMap::from([
+            (
+                "createdUrl".to_string(),
+                Value::String("https://example.com/1".to_string()),
+            ),
+            ("attempt".to_string(), Value::from(2)),
+        ]);
+
+        persist_globals(&root, &globals).unwrap();
+        assert_eq!(
+            persisted_globals_path(&root),
+            root.join(".http-client").join("http-client-globals.json")
+        );
+        assert_eq!(load_persisted_globals(&root).unwrap(), globals);
         std::fs::remove_dir_all(root).unwrap();
     }
 

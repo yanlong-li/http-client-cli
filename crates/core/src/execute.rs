@@ -1,6 +1,6 @@
 //! Request resolution and the response data model shared by all executors.
 
-use crate::handler::run_response_handler;
+use crate::handler::{run_response_handler_with_globals, GlobalChange, HeaderChange};
 use crate::parser::{Handler, Redirect, Request};
 use crate::rng::Rng;
 use crate::vars::{substitute, VarContext};
@@ -18,6 +18,7 @@ pub struct ResolvedRequest {
     pub follow_redirects: bool,
     pub timeout_secs: Option<u64>,
     pub connection_timeout_secs: Option<u64>,
+    pub pre_request_script: Option<Handler>,
     pub handler: Option<Handler>,
     pub redirect_to: Option<Redirect>,
 }
@@ -54,6 +55,7 @@ pub struct RunState {
     pub globals: BTreeMap<String, Value>,
     pub logs: Vec<String>,
     pub handler_errors: Vec<String>,
+    pub global_headers: BTreeMap<String, String>,
 }
 
 /// Substitutes all variables in a parsed request and returns the sendable form.
@@ -62,6 +64,7 @@ pub fn resolve_request(
     file_vars: &BTreeMap<String, Value>,
     env_vars: &BTreeMap<String, Value>,
     globals: &BTreeMap<String, Value>,
+    global_headers: &BTreeMap<String, String>,
     system_env: &dyn Fn(&str) -> Option<String>,
     rng: &mut Rng,
 ) -> Result<ResolvedRequest, String> {
@@ -74,10 +77,20 @@ pub fn resolve_request(
         system_env,
     };
     let url = substitute(&request.url, &ctx, rng)?;
-    let mut headers = Vec::with_capacity(request.headers.len());
+    let mut headers: Vec<(String, String)> = global_headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     for header in &request.headers {
         let value = substitute(&header.value, &ctx, rng)?;
-        headers.push((header.name.clone(), value));
+        if let Some(existing) = headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&header.name))
+        {
+            *existing = (header.name.clone(), value);
+        } else {
+            headers.push((header.name.clone(), value));
+        }
     }
     let body = request
         .body
@@ -93,6 +106,7 @@ pub fn resolve_request(
         follow_redirects: !request.no_redirect,
         timeout_secs: request.timeout_secs,
         connection_timeout_secs: request.connection_timeout_secs,
+        pre_request_script: request.pre_request_script.clone(),
         handler: request.handler.clone(),
         redirect_to: request.redirect_to.clone(),
     })
@@ -104,9 +118,53 @@ pub fn process_response(resolved: &ResolvedRequest, response: &ResponseData, sta
     let Some(Handler::Inline(script)) = resolved.handler.as_ref() else {
         return;
     };
-    let result = run_response_handler(script, response.status, &response.headers, &response.body);
-    for (name, value) in result.globals {
-        state.globals.insert(name, value);
+    process_handler(
+        script,
+        response.status,
+        &response.headers,
+        &response.body,
+        state,
+    );
+}
+
+/// Runs an inline pre-request script and folds its effects into the run state.
+pub fn process_pre_request(request: &Request, state: &mut RunState) {
+    let Some(Handler::Inline(script)) = request.pre_request_script.as_ref() else {
+        return;
+    };
+    process_handler(script, 0, &[], &[], state);
+}
+
+fn process_handler(
+    script: &str,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    state: &mut RunState,
+) {
+    let result = run_response_handler_with_globals(script, status, headers, body, &state.globals);
+    for change in result.globals {
+        match change {
+            GlobalChange::Set(name, value) => {
+                state.globals.insert(name, value);
+            }
+            GlobalChange::Clear(name) => {
+                state.globals.remove(&name);
+            }
+            GlobalChange::ClearAll => state.globals.clear(),
+        }
+    }
+    for change in result.headers {
+        match change {
+            HeaderChange::Set(name, value) => {
+                state.global_headers.insert(name, value);
+            }
+            HeaderChange::Clear(name) => {
+                state
+                    .global_headers
+                    .retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
+            }
+        }
     }
     state.logs.extend(result.logs);
     state.handler_errors.extend(result.errors);
@@ -137,6 +195,7 @@ mod tests {
             &file_vars,
             &BTreeMap::new(),
             &globals,
+            &BTreeMap::new(),
             &no_env,
             &mut rng,
         )
@@ -158,6 +217,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &no_env,
             &mut rng,
         )
@@ -176,6 +236,34 @@ mod tests {
         assert_eq!(
             state.globals.get("token").and_then(Value::as_str),
             Some("abc")
+        );
+    }
+
+    #[test]
+    fn pre_request_scripts_apply_globals_and_headers() {
+        let doc = parse(
+            "< {%\nclient.global.set(\"token\", \"abc\")\nclient.global.headers.set(\"Authorization\", client.global.get(\"token\"))\n%}\nGET https://example.com\n",
+        );
+        let mut state = RunState::default();
+        process_pre_request(&doc.requests[0], &mut state);
+        let mut rng = Rng::new();
+        let resolved = resolve_request(
+            &doc.requests[0],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &state.globals,
+            &state.global_headers,
+            &no_env,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(
+            state.globals.get("token"),
+            Some(&Value::String("abc".to_string()))
+        );
+        assert_eq!(
+            resolved.headers,
+            vec![("Authorization".to_string(), "abc".to_string())]
         );
     }
 }
